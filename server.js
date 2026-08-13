@@ -15,8 +15,10 @@ app.use(express.json());
 const pool = new Pool({
     connectionString: process.env.DATABASE_URL,
     ssl: {
-        rejectUnauthorized: false // Важно для Supabase
-    }
+        rejectUnauthorized: false,
+        require: true
+    },
+    family: 4  // Принудительно IPv4
 });
 
 // ============================================

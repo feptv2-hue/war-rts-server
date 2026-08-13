@@ -1,55 +1,46 @@
-// server.js
+// server.js - с поддержкой Supabase (PostgreSQL)
 const express = require('express');
 const cors = require('cors');
 const bcrypt = require('bcryptjs');
-const fs = require('fs');
-const path = require('path');
+const { Pool } = require('pg');
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
 // ============================================
-// НАСТРОЙКА БАЗЫ ДАННЫХ (JSON файл)
+// ПОДКЛЮЧЕНИЕ К SUPABASE (PostgreSQL)
 // ============================================
 
-const DB_PATH = path.join(__dirname, 'database.json');
-
-// Загрузка базы данных
-function loadDatabase() {
-    try {
-        if (fs.existsSync(DB_PATH)) {
-            const data = fs.readFileSync(DB_PATH, 'utf8');
-            return JSON.parse(data);
-        }
-    } catch (error) {
-        console.error('❌ Ошибка загрузки БД:', error);
+const pool = new Pool({
+    connectionString: process.env.DATABASE_URL,
+    ssl: {
+        rejectUnauthorized: false // Важно для Supabase
     }
-    return { players: {} };
-}
+});
 
-// Сохранение базы данных
-function saveDatabase() {
+// ============================================
+// СОЗДАНИЕ ТАБЛИЦ (если их нет)
+// ============================================
+
+async function initDatabase() {
     try {
-        const data = { players: playersDB };
-        fs.writeFileSync(DB_PATH, JSON.stringify(data, null, 2));
-        console.log('💾 База данных сохранена');
+        // Таблица игроков
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS players (
+                username VARCHAR(50) PRIMARY KEY,
+                password_hash VARCHAR(255) NOT NULL,
+                slots JSONB DEFAULT '["","","","",""]'::jsonb,
+                created_at TIMESTAMP DEFAULT NOW()
+            )
+        `);
+        console.log('✅ Таблицы созданы/проверены');
     } catch (error) {
-        console.error('❌ Ошибка сохранения БД:', error);
+        console.error('❌ Ошибка инициализации БД:', error);
     }
 }
 
-// Загружаем базу данных
-let playersDB = loadDatabase().players;
-
-// Авто-сохранение каждые 10 секунд
-setInterval(saveDatabase, 10000);
-
-// Сохраняем при изменении важных данных
-function updateAndSave(username, data) {
-    playersDB[username] = data;
-    saveDatabase();
-}
+initDatabase();
 
 // ============================================
 // ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
@@ -88,7 +79,13 @@ app.post('/api/auth/register', async (req, res) => {
             });
         }
 
-        if (playersDB[username]) {
+        // Проверяем существует ли пользователь
+        const checkResult = await pool.query(
+            'SELECT username FROM players WHERE username = $1',
+            [username]
+        );
+
+        if (checkResult.rows.length > 0) {
             return res.status(400).json({
                 success: false,
                 error: 'Пользователь с таким именем уже существует'
@@ -99,15 +96,11 @@ app.post('/api/auth/register', async (req, res) => {
         const salt = await bcrypt.genSalt(10);
         const hashedPassword = await bcrypt.hash(password, salt);
 
-        const newPlayer = {
-            username: username,
-            password: hashedPassword,
-            slots: [null, null, null, null, null],
-            createdAt: new Date().toISOString()
-        };
-
-        playersDB[username] = newPlayer;
-        saveDatabase();
+        // Сохраняем в БД
+        await pool.query(
+            'INSERT INTO players (username, password_hash) VALUES ($1, $2)',
+            [username, hashedPassword]
+        );
 
         const token = generateToken();
 
@@ -118,7 +111,7 @@ app.post('/api/auth/register', async (req, res) => {
             playerId: username,
             playerName: username,
             sessionToken: token,
-            slots: newPlayer.slots,
+            slots: [null, null, null, null, null],
             message: 'Регистрация успешна!'
         });
 
@@ -146,17 +139,23 @@ app.post('/api/auth/login', async (req, res) => {
             });
         }
 
-        const player = playersDB[username];
+        // Ищем пользователя
+        const result = await pool.query(
+            'SELECT * FROM players WHERE username = $1',
+            [username]
+        );
 
-        if (!player) {
+        if (result.rows.length === 0) {
             return res.status(404).json({
                 success: false,
                 error: 'Пользователь не найден'
             });
         }
 
+        const player = result.rows[0];
+
         // Проверяем пароль
-        const isPasswordValid = await bcrypt.compare(password, player.password);
+        const isPasswordValid = await bcrypt.compare(password, player.password_hash);
 
         if (!isPasswordValid) {
             return res.status(401).json({
@@ -167,6 +166,9 @@ app.post('/api/auth/login', async (req, res) => {
 
         const token = generateToken();
 
+        // Получаем слоты (JSONB → массив)
+        const slots = player.slots || [null, null, null, null, null];
+
         console.log(`✅ Вход: ${username}`);
 
         res.json({
@@ -174,7 +176,7 @@ app.post('/api/auth/login', async (req, res) => {
             playerId: username,
             playerName: username,
             sessionToken: token,
-            slots: player.slots,
+            slots: slots,
             message: 'Вход выполнен!'
         });
 
@@ -191,7 +193,7 @@ app.post('/api/auth/login', async (req, res) => {
 // 3️⃣ СОХРАНИТЬ СЛОТЫ
 // ============================================
 
-app.post('/api/player/slots', (req, res) => {
+app.post('/api/player/slots', async (req, res) => {
     try {
         const { username, slots } = req.body;
 
@@ -202,15 +204,6 @@ app.post('/api/player/slots', (req, res) => {
             });
         }
 
-        const player = playersDB[username];
-
-        if (!player) {
-            return res.status(404).json({
-                success: false,
-                error: 'Игрок не найден'
-            });
-        }
-
         if (!Array.isArray(slots) || slots.length !== 5) {
             return res.status(400).json({
                 success: false,
@@ -218,8 +211,24 @@ app.post('/api/player/slots', (req, res) => {
             });
         }
 
-        player.slots = slots;
-        saveDatabase();
+        // Проверяем что игрок существует
+        const checkResult = await pool.query(
+            'SELECT username FROM players WHERE username = $1',
+            [username]
+        );
+
+        if (checkResult.rows.length === 0) {
+            return res.status(404).json({
+                success: false,
+                error: 'Игрок не найден'
+            });
+        }
+
+        // Сохраняем слоты
+        await pool.query(
+            'UPDATE players SET slots = $1::jsonb WHERE username = $2',
+            [JSON.stringify(slots), username]
+        );
 
         console.log(`💾 Сохранены слоты для ${username}:`, slots);
 
@@ -241,23 +250,30 @@ app.post('/api/player/slots', (req, res) => {
 // 4️⃣ ПОЛУЧИТЬ ДАННЫЕ ИГРОКА
 // ============================================
 
-app.get('/api/player/:username', (req, res) => {
+app.get('/api/player/:username', async (req, res) => {
     try {
         const { username } = req.params;
-        const player = playersDB[username];
 
-        if (!player) {
+        const result = await pool.query(
+            'SELECT username, slots FROM players WHERE username = $1',
+            [username]
+        );
+
+        if (result.rows.length === 0) {
             return res.status(404).json({
                 success: false,
                 error: 'Игрок не найден'
             });
         }
 
+        const player = result.rows[0];
+        const slots = player.slots || [null, null, null, null, null];
+
         res.json({
             success: true,
             playerId: username,
             playerName: username,
-            slots: player.slots
+            slots: slots
         });
 
     } catch (error) {
@@ -273,17 +289,15 @@ app.get('/api/player/:username', (req, res) => {
 // 5️⃣ ВСЕ ИГРОКИ (для отладки)
 // ============================================
 
-app.get('/api/debug/players', (req, res) => {
+app.get('/api/debug/players', async (req, res) => {
     try {
-        const list = Object.keys(playersDB).map(username => ({
-            username,
-            slots: playersDB[username].slots,
-            createdAt: playersDB[username].createdAt
-        }));
+        const result = await pool.query(
+            'SELECT username, slots, created_at FROM players'
+        );
         res.json({
             success: true,
-            count: list.length,
-            players: list
+            count: result.rows.length,
+            players: result.rows
         });
     } catch (error) {
         res.status(500).json({
@@ -297,19 +311,21 @@ app.get('/api/debug/players', (req, res) => {
 // 6️⃣ УДАЛИТЬ ИГРОКА (для отладки)
 // ============================================
 
-app.delete('/api/debug/player/:username', (req, res) => {
+app.delete('/api/debug/player/:username', async (req, res) => {
     try {
         const { username } = req.params;
         
-        if (!playersDB[username]) {
+        const result = await pool.query(
+            'DELETE FROM players WHERE username = $1 RETURNING username',
+            [username]
+        );
+
+        if (result.rows.length === 0) {
             return res.status(404).json({
                 success: false,
                 error: 'Игрок не найден'
             });
         }
-
-        delete playersDB[username];
-        saveDatabase();
 
         res.json({
             success: true,
@@ -328,12 +344,20 @@ app.delete('/api/debug/player/:username', (req, res) => {
 // 7️⃣ ПРОВЕРКА ЗДОРОВЬЯ
 // ============================================
 
-app.get('/api/health', (req, res) => {
-    res.json({
-        status: 'OK',
-        players: Object.keys(playersDB).length,
-        timestamp: new Date().toISOString()
-    });
+app.get('/api/health', async (req, res) => {
+    try {
+        const result = await pool.query('SELECT COUNT(*) FROM players');
+        res.json({
+            status: 'OK',
+            players: parseInt(result.rows[0].count),
+            timestamp: new Date().toISOString()
+        });
+    } catch (error) {
+        res.status(500).json({
+            status: 'ERROR',
+            error: error.message
+        });
+    }
 });
 
 // ============================================
@@ -353,7 +377,6 @@ app.listen(PORT, '0.0.0.0', () => {
     console.log('═══════════════════════════════════════');
     console.log('🚀 WAR RTS СЕРВЕР ЗАПУЩЕН!');
     console.log(`📡 Порт: ${PORT}`);
-    console.log(`📡 Локально: http://localhost:${PORT}`);
     console.log(`📡 Внешний: https://war-rts-server.onrender.com`);
     console.log('═══════════════════════════════════════');
     console.log('📋 Эндпоинты:');
@@ -362,10 +385,9 @@ app.listen(PORT, '0.0.0.0', () => {
     console.log(`  POST /api/player/slots     - Сохранить слоты`);
     console.log(`  GET  /api/player/:username - Данные игрока`);
     console.log(`  GET  /api/health           - Проверка здоровья`);
-    console.log(`  GET  /api/debug/players    - Все игроки (отладка)`);
+    console.log(`  GET  /api/debug/players    - Все игроки`);
     console.log(`  DEL  /api/debug/player/:username - Удалить игрока`);
     console.log('═══════════════════════════════════════');
-    console.log(`💾 База данных: ${DB_PATH}`);
-    console.log(`👥 Игроков в БД: ${Object.keys(playersDB).length}`);
+    console.log(`🗄️  База данных: Supabase (PostgreSQL)`);
     console.log('═══════════════════════════════════════');
 });
